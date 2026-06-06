@@ -148,18 +148,14 @@ class STTService:
             os.remove(temp_path)
 
         raw_words = self._flatten_aligned_words(transcription.get("segments", []))
-        filtered_words = [
-            word
-            for word in raw_words
-            if word.get("text") and self._overlaps_speech(word["start"], word["end"], speech_spans)
-        ]
+        filtered_words = self._filter_words_by_speech(raw_words, speech_spans)
 
         sentences = self._group_words_into_sentences(filtered_words)
+        paragraphs = await self._build_paragraph_chunks(filtered_words, sentences)
         sentences = await self._translate_sentences(sentences, course_domain)
-        paragraphs = await self._build_paragraph_chunks(filtered_words)
         paragraphs = await self._translate_paragraphs(paragraphs, course_domain)
         paragraph_dicts = [paragraph.__dict__ for paragraph in paragraphs]
-        sentence_dicts = [sentence for sentence in sentences]
+        sentence_dicts = sentences
 
         storage_path = self._upload_blob(file_bytes, file_hash, file.filename, file.content_type or "audio/mpeg", user_id)
         metadata = {
@@ -266,18 +262,41 @@ class STTService:
 
         return flattened
 
-    def _overlaps_speech(self, start: float, end: float, speech_spans: List[Tuple[float, float]]) -> bool:
+    def _filter_words_by_speech(self, words: List[Dict], speech_spans: List[Tuple[float, float]]) -> List[Dict]:
         if not speech_spans:
-            return True
-        return any(span_start <= end and span_end >= start for span_start, span_end in speech_spans)
+            return [word for word in words if word.get("text")]
 
-    async def _build_paragraph_chunks(self, words: List[Dict]) -> List[ParagraphChunk]:
-        sentences = self._group_words_into_sentences(words)
-        if sentences and self.llm_client:
+        filtered: List[Dict] = []
+        spans = sorted(speech_spans)
+        span_index = 0
+
+        for word in words:
+            if not word.get("text"):
+                continue
+
+            start = word["start"]
+            end = word["end"]
+            while span_index < len(spans) and spans[span_index][1] < start:
+                span_index += 1
+
+            if span_index < len(spans):
+                span_start, span_end = spans[span_index]
+                if span_start <= end and span_end >= start:
+                    filtered.append(word)
+
+        return filtered
+
+    async def _build_paragraph_chunks(
+        self,
+        words: List[Dict],
+        sentences: Optional[List[Dict]] = None
+    ) -> List[ParagraphChunk]:
+        sentence_list = sentences if sentences is not None else self._group_words_into_sentences(words)
+        if sentence_list and self.llm_client:
             try:
-                chunk_ids = await self._semantic_chunk_sentences(sentences)
+                chunk_ids = await self._semantic_chunk_sentences(sentence_list)
                 if chunk_ids:
-                    paragraphs = self._assemble_paragraphs_from_chunks(sentences, chunk_ids)
+                    paragraphs = self._assemble_paragraphs_from_chunks(sentence_list, chunk_ids)
                     if paragraphs:
                         return paragraphs
             except Exception as exc:
