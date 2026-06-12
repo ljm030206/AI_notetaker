@@ -10,24 +10,13 @@ import { createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, on
 import { collection, query, where, getDocs } from "firebase/firestore";
 import { getStorage, ref, getDownloadURL } from "firebase/storage";
 import { buildApiUrl } from "@/lib/api";
-
-interface ParagraphChunk {
-  id: number;
-  start: number;
-  end: number;
-  text: string;
-  translation: string;
-  speaker: string;
-}
-
-interface SubtitleChunk {
-  id: number;
-  start: number;
-  end: number;
-  text: string;
-  translation: string;
-  speaker: string;
-}
+import {
+  normalizeParagraphList,
+  normalizeSubtitleList,
+  type TranscriptParagraph,
+  type TranscriptPayload,
+  type TranscriptSentence,
+} from "@/lib/transcript";
 
 const TIMESTAMP_REGEX = /\[?(\d{1,2}:\d{2})\]?/g;
 
@@ -52,29 +41,6 @@ const formatSecondsLabel = (seconds: number) => {
   const minutes = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60);
   return `${minutes}:${secs.toString().padStart(2, "0")}`;
-};
-
-const splitSentenceText = (text: string) => {
-  const trimmed = text.trim();
-  if (!trimmed) return [];
-
-  const pieces = trimmed.match(/[^.!?。！？]+[.!?。！？]?/g);
-  if (!pieces) return [trimmed];
-
-  return pieces.map((piece) => piece.trim()).filter(Boolean);
-};
-
-const coerceNumber = (value: unknown): number | null => {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-
-  if (typeof value === "string") {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-
-  return null;
 };
 
 const findLatestByStart = <T extends { start: number }>(
@@ -159,6 +125,57 @@ interface StoredFilePreview {
   [key: string]: unknown;
 }
 
+type TranscriptionJobStatus = "queued" | "processing" | "completed" | "failed";
+
+interface TranscriptionJobPreview {
+  job_id: string;
+  status: TranscriptionJobStatus;
+  progress: number;
+  file_hash: string;
+  fileName: string;
+  fileType?: string;
+  result_file_hash?: string | null;
+  error?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+const TERMINAL_JOB_STATUSES = new Set<TranscriptionJobStatus>(["completed", "failed"]);
+
+const getJobStatusLabel = (status: TranscriptionJobStatus) => {
+  switch (status) {
+    case "queued":
+      return "대기 중";
+    case "processing":
+      return "처리 중";
+    case "completed":
+      return "완료";
+    case "failed":
+      return "실패";
+  }
+};
+
+const normalizeTranscriptionJob = (source: Record<string, unknown>): TranscriptionJobPreview => {
+  const rawStatus = typeof source.status === "string" ? source.status : "queued";
+  const status: TranscriptionJobStatus = ["queued", "processing", "completed", "failed"].includes(rawStatus)
+    ? (rawStatus as TranscriptionJobStatus)
+    : "queued";
+  const progress = typeof source.progress === "number" ? source.progress : 0;
+
+  return {
+    job_id: typeof source.job_id === "string" ? source.job_id : "",
+    status,
+    progress: Math.max(0, Math.min(100, progress)),
+    file_hash: typeof source.file_hash === "string" ? source.file_hash : "",
+    fileName: typeof source.fileName === "string" ? source.fileName : "media",
+    fileType: typeof source.fileType === "string" ? source.fileType : undefined,
+    result_file_hash: typeof source.result_file_hash === "string" ? source.result_file_hash : null,
+    error: typeof source.error === "string" ? source.error : null,
+    createdAt: typeof source.createdAt === "string" ? source.createdAt : undefined,
+    updatedAt: typeof source.updatedAt === "string" ? source.updatedAt : undefined,
+  };
+};
+
 const PdfViewer = dynamic(() => import("@/components/PdfViewer"), {
   ssr: false,
   loading: () => (
@@ -198,9 +215,11 @@ export default function Home() {
   const [currentFileHash, setCurrentFileHash] = useState<string>("");
   const audioRef = useRef<HTMLAudioElement>(null);
   const mediaPlayerRef = useRef<HTMLMediaElement | null>(null);
-  const [paragraphs, setParagraphs] = useState<ParagraphChunk[]>([]);
-  const [subtitleSegments, setSubtitleSegments] = useState<SubtitleChunk[]>([]);
-  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [paragraphs, setParagraphs] = useState<TranscriptParagraph[]>([]);
+  const [subtitleSegments, setSubtitleSegments] = useState<TranscriptSentence[]>([]);
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [transcriptionJobs, setTranscriptionJobs] = useState<TranscriptionJobPreview[]>([]);
+  const [batchMaxConcurrent, setBatchMaxConcurrent] = useState(2);
   const [isCourseModalOpen, setIsCourseModalOpen] = useState(false);
   const [selectedCourse, setSelectedCourse] = useState(COURSE_OPTIONS[0]);
   
@@ -213,106 +232,10 @@ export default function Home() {
   
   const scrollRef = useRef<HTMLDivElement>(null);
   const activeScriptRef = useRef<HTMLDivElement>(null); // ✅ 활성화된 스크립트 자동 스크롤 추적용
-  const normalizeParagraphList = useCallback((data: { paragraphs?: unknown; scripts?: unknown }): ParagraphChunk[] => {
-    const rawParagraphs = Array.isArray(data.paragraphs) && data.paragraphs.length > 0
-      ? data.paragraphs
-      : Array.isArray(data.scripts) && data.scripts.length > 0
-        ? data.scripts
-        : [];
-
-    return rawParagraphs
-      .map((script, idx: number) => {
-        const source = script as Record<string, unknown>;
-        const start = coerceNumber(source.start);
-        const end = coerceNumber(source.end);
-
-        if (start === null) {
-          return null;
-        }
-
-        return {
-          id: typeof source.id === "number" ? source.id : idx,
-          start,
-          end: end === null ? start : Math.max(start, end),
-          text: typeof source.text === "string" ? source.text : "",
-          translation: typeof source.translation === "string" ? source.translation : "",
-          speaker: typeof source.speaker === "string" ? source.speaker : "Speaker 1",
-        };
-      })
-      .filter((paragraph): paragraph is ParagraphChunk => paragraph !== null);
-  }, []);
-
-  const normalizeSubtitleList = useCallback((data: { sentences?: unknown; paragraphs?: unknown; scripts?: unknown }): SubtitleChunk[] => {
-    if (Array.isArray(data.sentences) && data.sentences.length > 0) {
-      return data.sentences
-        .map((sentence, idx: number) => {
-          const source = sentence as Record<string, unknown>;
-          const start = coerceNumber(source.start);
-          const end = coerceNumber(source.end);
-
-          if (start === null) {
-            return null;
-          }
-
-          const text = typeof source.text === "string" ? source.text : "";
-          const translation = typeof source.translation === "string" ? source.translation : text;
-
-          return {
-            id: typeof source.id === "number" ? source.id : idx,
-            start,
-            end: end === null ? start : Math.max(start, end),
-            text,
-            translation,
-            speaker: typeof source.speaker === "string" ? source.speaker : "Speaker 1",
-          };
-        })
-        .filter((sentence): sentence is SubtitleChunk => sentence !== null);
-    }
-
-    const paragraphFallbacks = normalizeParagraphList(data);
-    return paragraphFallbacks.flatMap((paragraph, paragraphIndex) => {
-      const sourceText = paragraph.translation.trim() || paragraph.text.trim();
-      const sentenceTexts = splitSentenceText(sourceText);
-      if (sentenceTexts.length <= 1) {
-        return [{
-          id: paragraph.id * 1000 + paragraphIndex,
-          start: paragraph.start,
-          end: paragraph.end,
-          text: paragraph.text,
-          translation: sourceText,
-          speaker: paragraph.speaker,
-        }];
-      }
-
-      const totalDuration = Math.max(0.1, paragraph.end - paragraph.start);
-      const lengths = sentenceTexts.map((sentence) => Math.max(1, sentence.length));
-      const totalLength = lengths.reduce((sum, length) => sum + length, 0);
-      let cursor = paragraph.start;
-
-      return sentenceTexts.map((sentenceText, sentenceIndex) => {
-        const ratio = lengths[sentenceIndex] / totalLength;
-        const segmentEnd = sentenceIndex === sentenceTexts.length - 1
-          ? paragraph.end
-          : Math.min(paragraph.end, cursor + totalDuration * ratio);
-
-        const segment = {
-          id: paragraph.id * 1000 + sentenceIndex,
-          start: cursor,
-          end: Math.max(cursor, segmentEnd),
-          text: sentenceText,
-          translation: sentenceText,
-          speaker: paragraph.speaker,
-        };
-        cursor = segment.end;
-        return segment;
-      });
-    });
-  }, [normalizeParagraphList]);
-
-  const syncParagraphResponse = useCallback((data: { paragraphs?: unknown; scripts?: unknown; sentences?: unknown }) => {
+  const syncParagraphResponse = useCallback((data: TranscriptPayload) => {
     setParagraphs(normalizeParagraphList(data));
     setSubtitleSegments(normalizeSubtitleList(data));
-  }, [normalizeParagraphList, normalizeSubtitleList]);
+  }, []);
 
   const resetWorkspaceContent = useCallback(() => {
     setPdfFile(null);
@@ -499,88 +422,169 @@ export default function Home() {
     }
   };
 
-  const processFileUpload = async (file: File, courseDomain: string) => {
+  useEffect(() => {
     if (!user) return;
-    setCurrentView("workspace");
-    resetWorkspaceContent();
 
-    const isPdf = file.type === "application/pdf";
-    const isAudio = file.type.startsWith("audio/");
+    const activeJobs = transcriptionJobs.filter((job) => !TERMINAL_JOB_STATUSES.has(job.status));
+    if (activeJobs.length === 0) return;
+
+    let cancelled = false;
+    const pollJobs = async () => {
+      try {
+        const updates = await Promise.all(
+          activeJobs.map(async (job) => {
+            const response = await fetch(buildApiUrl(`/api/transcription-jobs/${job.job_id}`));
+            if (!response.ok) return job;
+            const data = await response.json();
+            return normalizeTranscriptionJob(data as Record<string, unknown>);
+          })
+        );
+
+        if (cancelled) return;
+
+        const previousById = new Map(transcriptionJobs.map((job) => [job.job_id, job]));
+        const updateById = new Map(updates.map((job) => [job.job_id, job]));
+        const hasNewCompletion = updates.some((job) => {
+          const previous = previousById.get(job.job_id);
+          return previous?.status !== "completed" && job.status === "completed";
+        });
+
+        setTranscriptionJobs((prev) =>
+          prev.map((job) => updateById.get(job.job_id) ?? job)
+        );
+
+        if (hasNewCompletion) {
+          fetchMyFiles(user.uid);
+        }
+      } catch (error) {
+        console.warn("전사 job 상태 갱신 실패:", error);
+      }
+    };
+
+    pollJobs();
+    const intervalId = window.setInterval(pollJobs, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [transcriptionJobs, user]);
+
+  const uploadPdfFile = async (file: File, courseDomain: string, openAfterUpload: boolean) => {
+    if (!user) return;
 
     const formData = new FormData();
     formData.append("file", file);
     formData.append("user_id", user.uid);
     formData.append("course_domain", courseDomain);
 
-    setIsVideoProcessing(true);
-
-    if (isPdf) {
+    if (openAfterUpload) {
+      setCurrentView("workspace");
+      resetWorkspaceContent();
       setPdfFile(file);
       setmediaUrl(null);
       setMediaType(null);
-
-      try {
-        const response = await fetch(buildApiUrl("/api/upload-pdf"), {
-          method: "POST",
-          body: formData,
-        });
-        if (!response.ok) throw new Error("PDF 업로드 실패");
-        const data = await response.json();
-        syncParagraphResponse(data);
-        setCurrentFileHash(data.file_info.hash);
-        fetchMyFiles(user.uid);
-      } catch (error) {
-        console.error("PDF 업로드 에러:", error);
-        alert("파일을 등록하는 데 실패했습니다.");
-        setCurrentView("lobby");
-      } finally {
-        setIsVideoProcessing(false);
-      }
-      return;
+      setIsVideoProcessing(true);
     }
 
-    const url = URL.createObjectURL(file);
-    setmediaUrl(url);
-    setPdfFile(null);
-    setMediaType(isAudio ? "audio" : "video");
-
     try {
-      const response = await fetch(buildApiUrl("/api/transcribe-media"), {
+      const response = await fetch(buildApiUrl("/api/upload-pdf"), {
         method: "POST",
         body: formData,
       });
-      if (!response.ok) throw new Error("미디어 전사 실패");
+      if (!response.ok) throw new Error("PDF 업로드 실패");
       const data = await response.json();
-      syncParagraphResponse(data);
-      setCurrentFileHash(data.file_info.hash);
+      if (openAfterUpload) {
+        syncParagraphResponse(data);
+        setCurrentFileHash(data.file_info.hash);
+      }
       fetchMyFiles(user.uid);
     } catch (error) {
-      console.error("업로드 에러:", error);
-      alert("파일을 분석하는 데 실패했습니다.");
-      setCurrentView("lobby");
+      console.error("PDF 업로드 에러:", error);
+      alert("파일을 등록하는 데 실패했습니다.");
+      if (openAfterUpload) {
+        setCurrentView("lobby");
+      }
     } finally {
-      setIsVideoProcessing(false);
+      if (openAfterUpload) {
+        setIsVideoProcessing(false);
+      }
+    }
+  };
+
+  const createTranscriptionJobs = async (mediaFiles: File[], courseDomain: string) => {
+    if (!user || mediaFiles.length === 0) return;
+
+    const formData = new FormData();
+    mediaFiles.forEach((file) => formData.append("files", file));
+    formData.append("user_id", user.uid);
+    formData.append("course_domain", courseDomain);
+
+    try {
+      const response = await fetch(buildApiUrl("/api/transcription-jobs"), {
+        method: "POST",
+        body: formData,
+      });
+      if (!response.ok) throw new Error("미디어 전사 job 생성 실패");
+      const data = await response.json();
+      if (typeof data.max_concurrent === "number") {
+        setBatchMaxConcurrent(data.max_concurrent);
+      }
+      const jobs = Array.isArray(data.jobs)
+        ? data.jobs.map((job: unknown) =>
+            normalizeTranscriptionJob(
+              typeof job === "object" && job !== null ? (job as Record<string, unknown>) : {}
+            )
+          ).filter((job: TranscriptionJobPreview) => job.job_id)
+        : [];
+      setTranscriptionJobs((prev) => {
+        const knownIds = new Set(prev.map((job) => job.job_id));
+        const freshJobs = jobs.filter((job: TranscriptionJobPreview) => !knownIds.has(job.job_id));
+        return [...freshJobs, ...prev];
+      });
+    } catch (error) {
+      console.error("업로드 에러:", error);
+      alert("파일 분석 작업을 시작하지 못했습니다.");
+    }
+  };
+
+  const processSelectedFiles = async (files: File[], courseDomain: string) => {
+    if (!user || files.length === 0) return;
+
+    const pdfFiles = files.filter((file) => file.type === "application/pdf");
+    const mediaFiles = files.filter((file) => file.type !== "application/pdf");
+    const shouldOpenSinglePdf = pdfFiles.length === 1 && mediaFiles.length === 0;
+
+    if (shouldOpenSinglePdf) {
+      await uploadPdfFile(pdfFiles[0], courseDomain, true);
+      return;
+    }
+
+    await Promise.all(pdfFiles.map((file) => uploadPdfFile(file, courseDomain, false)));
+    await createTranscriptionJobs(mediaFiles, courseDomain);
+
+    if (currentView === "auth") {
+      setCurrentView("lobby");
     }
   };
 
   const handleMediaUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const files = Array.from(e.target.files ?? []);
     e.target.value = "";
-    if (!file || !user) return;
-    setPendingFile(file);
+    if (files.length === 0 || !user) return;
+    setPendingFiles(files);
     setSelectedCourse(COURSE_OPTIONS[0]);
     setIsCourseModalOpen(true);
   };
 
   const handleStartCourseProcessing = async () => {
-    if (!pendingFile) return;
+    if (pendingFiles.length === 0) return;
     setIsCourseModalOpen(false);
-    await processFileUpload(pendingFile, selectedCourse);
-    setPendingFile(null);
+    await processSelectedFiles(pendingFiles, selectedCourse);
+    setPendingFiles([]);
   };
 
   const handleCourseModalCancel = () => {
-    setPendingFile(null);
+    setPendingFiles([]);
     setIsCourseModalOpen(false);
     setSelectedCourse(COURSE_OPTIONS[0]);
   };
@@ -594,7 +598,8 @@ export default function Home() {
             <div>
               <h3 className="text-lg font-bold text-gray-900 dark:text-gray-100">Which course is this lecture for?</h3>
               <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-                Select the most appropriate course so AI can tailor transcription and translation.
+                {pendingFiles.length}개 파일에 같은 course 설정을 적용합니다.
+                영상/음성은 백그라운드에서 병렬 처리됩니다.
               </p>
             </div>
             <button
@@ -727,6 +732,18 @@ export default function Home() {
     } finally {
       setIsVideoProcessing(false);
     }
+  };
+
+  const handleOpenCompletedJob = async (job: TranscriptionJobPreview) => {
+    const fileId = job.result_file_hash || job.file_hash;
+    if (!fileId || job.status !== "completed") return;
+    const existingFile = myFiles.find((file) => file.id === fileId || file.hash === fileId);
+    await handleLoadPastFile(existingFile ?? {
+      id: fileId,
+      hash: fileId,
+      fileName: job.fileName,
+      fileType: job.fileType,
+    });
   };
 
   const handleDeleteFile = async (e: React.MouseEvent, fileId: string) => {
@@ -868,6 +885,10 @@ export default function Home() {
     [transcriptions, currentSlide]
   );
   const currentSummary = useMemo(() => summaries[currentSlide], [summaries, currentSlide]);
+  const activeBatchJobCount = useMemo(
+    () => transcriptionJobs.filter((job) => !TERMINAL_JOB_STATUSES.has(job.status)).length,
+    [transcriptionJobs]
+  );
   const sortedParagraphs = useMemo(
     () => [...paragraphs].sort((a, b) => a.start - b.start || a.end - b.end || a.id - b.id),
     [paragraphs]
@@ -984,10 +1005,71 @@ export default function Home() {
               <label className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-xl cursor-pointer transition-all shadow-md hover:shadow-lg">
                 <Plus size={20} />
                 <span className="font-bold">새 파일 업로드</span>
-                <input type="file" accept="video/*, audio/*, .pdf" className="hidden" onChange={handleMediaUpload} />
+                <input type="file" accept="video/*, audio/*, .pdf" multiple className="hidden" onChange={handleMediaUpload} />
               </label>
             </div>
           </div>
+
+          {transcriptionJobs.length > 0 && (
+            <section className="mb-8 rounded-3xl border border-indigo-100 bg-white p-5 shadow-sm">
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <h3 className="text-base font-extrabold text-gray-800">백그라운드 전사 작업</h3>
+                  <p className="text-xs text-gray-500 mt-1">
+                    실시간 녹음과 별개로 영상/음성 파일을 최대 {batchMaxConcurrent}개씩 처리합니다.
+                  </p>
+                </div>
+                <span className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-bold text-indigo-600">
+                  진행 중 {activeBatchJobCount}개
+                </span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {transcriptionJobs.map((job) => {
+                  const isCompleted = job.status === "completed";
+                  const isFailed = job.status === "failed";
+                  return (
+                    <div key={job.job_id} className="rounded-2xl border border-gray-100 bg-gray-50 p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-bold text-gray-800">{job.fileName}</p>
+                          <p className={`mt-1 text-xs font-bold ${
+                            isFailed ? "text-red-500" : isCompleted ? "text-emerald-600" : "text-indigo-600"
+                          }`}>
+                            {getJobStatusLabel(job.status)}
+                          </p>
+                        </div>
+                        {isCompleted ? (
+                          <button
+                            type="button"
+                            onClick={() => handleOpenCompletedJob(job)}
+                            className="shrink-0 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-700 transition"
+                          >
+                            열기
+                          </button>
+                        ) : (
+                          <Loader2
+                            size={18}
+                            className={isFailed ? "text-red-400" : "animate-spin text-indigo-500"}
+                          />
+                        )}
+                      </div>
+                      <div className="mt-3 h-2 overflow-hidden rounded-full bg-white">
+                        <div
+                          className={`h-full rounded-full transition-all ${
+                            isFailed ? "bg-red-400" : isCompleted ? "bg-emerald-500" : "bg-indigo-500"
+                          }`}
+                          style={{ width: `${job.progress}%` }}
+                        />
+                      </div>
+                      {job.error && (
+                        <p className="mt-2 line-clamp-2 text-xs text-red-500">{job.error}</p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )}
 
           {isLoadingFiles ? (
             <div className="flex flex-col items-center justify-center py-32 text-indigo-400">
@@ -1063,7 +1145,18 @@ export default function Home() {
             작업실
           </h1>
         </div>
-        {/* 기존 우측 업로드 버튼들은 로비로 빼버렸으므로 생략! 훨씬 깔끔해졌습니다. */}
+        <div className="flex items-center gap-3">
+          {activeBatchJobCount > 0 && (
+            <span className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-bold text-indigo-600">
+              백그라운드 처리 {activeBatchJobCount}개
+            </span>
+          )}
+          <label className="flex items-center gap-2 rounded-xl bg-gray-900 px-4 py-2 text-sm font-bold text-white cursor-pointer hover:bg-gray-800 transition">
+            <Upload size={16} />
+            파일 추가 처리
+            <input type="file" accept="video/*, audio/*, .pdf" multiple className="hidden" onChange={handleMediaUpload} />
+          </label>
+        </div>
       </header>
 
       {/* --- 이하 기존 <main> 뷰어 및 우측 스크립트 영역 코드 복붙 (수정 없음) --- */}

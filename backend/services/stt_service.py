@@ -4,7 +4,7 @@ import io
 import os
 import tempfile
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -14,6 +14,13 @@ from pydub import AudioSegment
 
 from backend.core.llm_client import LLMClient
 from backend.core.whisperx_adapter import WhisperXAdapter
+from backend.schemas.transcript import (
+    TRANSCRIPT_SCHEMA_VERSION,
+    assign_sentence_paragraph_links,
+    normalize_transcript_payload,
+    select_words_by_speech,
+    validate_ordered_chunks,
+)
 from backend.services.translator import translate_text
 
 
@@ -25,6 +32,9 @@ class ParagraphChunk:
     text: str
     speaker: str
     translation: str = ""
+    sentence_ids: List[int] = field(default_factory=list)
+    word_start_index: Optional[int] = None
+    word_end_index: Optional[int] = None
 
 
 @dataclass
@@ -100,6 +110,12 @@ class VADFilter:
 class STTService:
     MAX_SILENCE_GAP = 2.0
     CHUNK_MAX_DURATION = 20.0
+    MAX_SENTENCE_DURATION = 14.0
+    MAX_SENTENCE_WORDS = 36
+    SENTENCE_PAUSE_GAP = 0.9
+    MIN_SENTENCE_WORDS_FOR_PAUSE = 3
+    VAD_WORD_MARGIN_SECONDS = 0.25
+    VAD_MAX_DROP_RATIO = 0.35
     SENTENCE_BOUNDARIES = {".", "?", "!"}
     COURSE_CONTEXT_KEYWORDS = {
         "Programming Language": "compiler, syntax, type systems, data structures, algorithms, control flow, functions",
@@ -129,15 +145,31 @@ class STTService:
         return self.DEFAULT_COURSE_PROMPT
 
     async def transcribe_media(self, file: UploadFile, user_id: str, course_domain: str = "General") -> Dict:
-        print(f"🎵 STTService: Transcribing media file '{file.filename}' for user '{user_id}'")
         file_bytes = await file.read()
+        return await self.transcribe_bytes(
+            file_bytes=file_bytes,
+            filename=file.filename or "media",
+            content_type=file.content_type,
+            user_id=user_id,
+            course_domain=course_domain,
+        )
+
+    async def transcribe_bytes(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        content_type: Optional[str],
+        user_id: str,
+        course_domain: str = "General",
+    ) -> Dict:
+        print(f"🎵 STTService: Transcribing media file '{filename}' for user '{user_id}'")
         file_hash = self._hash_bytes(file_bytes)
         doc_ref = self.db.collection("files").document(file_hash)
         snapshot = doc_ref.get()
         if snapshot.exists:
             return self._cached_result(snapshot, doc_ref)
 
-        normalized_audio = self._normalize_audio(file_bytes, file.content_type)
+        normalized_audio = self._normalize_audio(file_bytes, content_type)
         speech_spans = self.vad_filter.get_speech_segments(normalized_audio)
 
         temp_path = self._dump_temp_wav(normalized_audio)
@@ -148,29 +180,46 @@ class STTService:
             os.remove(temp_path)
 
         raw_words = self._flatten_aligned_words(transcription.get("segments", []))
-        filtered_words = self._filter_words_by_speech(raw_words, speech_spans)
+        filtered_words, transcription_debug = select_words_by_speech(
+            raw_words,
+            speech_spans,
+            margin_seconds=self.VAD_WORD_MARGIN_SECONDS,
+            max_drop_ratio=self.VAD_MAX_DROP_RATIO,
+        )
 
         sentences = self._group_words_into_sentences(filtered_words)
         paragraphs = await self._build_paragraph_chunks(filtered_words, sentences)
+        assign_sentence_paragraph_links(paragraphs, sentences)
         sentences = await self._translate_sentences(sentences, course_domain)
         paragraphs = await self._translate_paragraphs(paragraphs, course_domain)
-        paragraph_dicts = [paragraph.__dict__ for paragraph in paragraphs]
+        paragraph_dicts = [asdict(paragraph) for paragraph in paragraphs]
         sentence_dicts = sentences
+        transcription_debug.update({
+            "language": transcription.get("language", "unknown"),
+            "model": transcription.get("model", getattr(self.whisper_adapter, "model_name", "unknown")),
+            "segment_count": len(transcription.get("segments", [])),
+            "sentence_count": len(sentence_dicts),
+            "paragraph_count": len(paragraph_dicts),
+        })
 
-        storage_path = self._upload_blob(file_bytes, file_hash, file.filename, file.content_type or "audio/mpeg", user_id)
+        storage_path = self._upload_blob(file_bytes, file_hash, filename, content_type or "audio/mpeg", user_id)
         metadata = {
-            "fileName": file.filename,
-            "fileType": file.content_type or "audio",
+            "fileName": filename,
+            "fileType": content_type or "audio",
             "storage_path": storage_path,
             "uploadedAt": datetime.now().isoformat(),
             "hash": file_hash,
             "userId": user_id,
             "paragraph_count": len(paragraphs),
             "sentence_count": len(sentence_dicts),
+            "word_count": len(filtered_words),
             "word_timestamps": filtered_words,
             "summary": {},
             "video_summary": "",
-            "courseDomain": course_domain
+            "courseDomain": course_domain,
+            "language": transcription.get("language", "unknown"),
+            "transcript_schema_version": TRANSCRIPT_SCHEMA_VERSION,
+            "transcription_debug": transcription_debug
         }
         metadata["sentences"] = sentence_dicts
 
@@ -183,19 +232,26 @@ class STTService:
             "scripts": paragraph_dicts,
             "sentences": sentence_dicts,
             "word_timestamps": filtered_words,
+            "transcription_debug": transcription_debug,
             "is_cached": False,
             "file_info": metadata
         }
 
     def _cached_result(self, snapshot, doc_ref):
-        paragraphs = [
+        raw_paragraphs = [
             doc.to_dict() for doc in doc_ref.collection("paragraphs").order_by("id").stream()
         ]
+        paragraphs, sentences, word_timestamps = normalize_transcript_payload(
+            raw_paragraphs,
+            snapshot.get("sentences", []),
+            snapshot.get("word_timestamps", []),
+        )
         return {
             "paragraphs": paragraphs,
             "scripts": paragraphs,
-            "sentences": snapshot.get("sentences", []),
-            "word_timestamps": snapshot.get("word_timestamps", []),
+            "sentences": sentences,
+            "word_timestamps": word_timestamps,
+            "transcription_debug": snapshot.get("transcription_debug", {}),
             "is_cached": True,
             "file_info": snapshot.to_dict()
         }
@@ -244,8 +300,14 @@ class STTService:
         flattened = []
         for segment in segments:
             segment_speaker = segment.get("speaker")
+            segment_words = segment.get("words", [])
 
-            for word in segment.get("words", []):
+            if not segment_words:
+                flattened.extend(self._fallback_words_from_segment(segment, segment_speaker))
+                continue
+
+            segment_word_count = 0
+            for word in segment_words:
                 text = word.get("word") or word.get("text")
                 start = word.get("start")
                 end = word.get("end")
@@ -257,34 +319,41 @@ class STTService:
                     "start": start,
                     "end": end,
                     "speaker": word.get("speaker") or segment_speaker or "Speaker 1",
-                    "confidence": word.get("confidence", 0.0)
+                    "confidence": word.get("confidence", word.get("score", 0.0))
                 })
+                segment_word_count += 1
+
+            if segment_word_count == 0:
+                flattened.extend(self._fallback_words_from_segment(segment, segment_speaker))
 
         return flattened
 
-    def _filter_words_by_speech(self, words: List[Dict], speech_spans: List[Tuple[float, float]]) -> List[Dict]:
-        if not speech_spans:
-            return [word for word in words if word.get("text")]
+    def _fallback_words_from_segment(self, segment: Dict, speaker: Optional[str]) -> List[Dict]:
+        text = str(segment.get("text") or "").strip()
+        start = segment.get("start")
+        end = segment.get("end")
+        if not text or start is None or end is None:
+            return []
 
-        filtered: List[Dict] = []
-        spans = sorted(speech_spans)
-        span_index = 0
+        tokens = [token.strip() for token in text.split() if token.strip()]
+        if not tokens:
+            return []
 
-        for word in words:
-            if not word.get("text"):
-                continue
+        duration = max(0.02, float(end) - float(start))
+        token_duration = duration / len(tokens)
+        fallback_words: List[Dict] = []
 
-            start = word["start"]
-            end = word["end"]
-            while span_index < len(spans) and spans[span_index][1] < start:
-                span_index += 1
+        for index, token in enumerate(tokens):
+            fallback_words.append({
+                "text": token,
+                "start": float(start) + token_duration * index,
+                "end": float(start) + token_duration * (index + 1),
+                "speaker": speaker or "Speaker 1",
+                "confidence": 0.0,
+                "source": "segment_fallback",
+            })
 
-            if span_index < len(spans):
-                span_start, span_end = spans[span_index]
-                if span_start <= end and span_end >= start:
-                    filtered.append(word)
-
-        return filtered
+        return fallback_words
 
     async def _build_paragraph_chunks(
         self,
@@ -295,10 +364,13 @@ class STTService:
         if sentence_list and self.llm_client:
             try:
                 chunk_ids = await self._semantic_chunk_sentences(sentence_list)
+                expected_ids = [sentence["sentence_id"] for sentence in sentence_list]
+                chunk_ids = validate_ordered_chunks(expected_ids, chunk_ids) or []
                 if chunk_ids:
                     paragraphs = self._assemble_paragraphs_from_chunks(sentence_list, chunk_ids)
                     if paragraphs:
                         return paragraphs
+                raise ValueError("LLM returned invalid or incomplete semantic chunks")
             except Exception as exc:
                 print(f"⚠️ Semantic chunking failed: {exc}")
         return self._fallback_chunking(words)
@@ -315,44 +387,65 @@ class STTService:
             start = word["start"]
             end = word["end"]
             speaker = word.get("speaker", "Speaker 1")
-            ends_sentence = self._ends_sentence(text)
+            gap = start - current["end"] if current else 0.0
+
+            if (
+                current is not None
+                and gap >= self.SENTENCE_PAUSE_GAP
+                and current.get("word_count", 0) >= self.MIN_SENTENCE_WORDS_FOR_PAUSE
+            ):
+                sentences.append(self._finalize_sentence(current))
+                sentence_id += 1
+                current = None
 
             if current is None:
                 current = {
+                    "id": sentence_id,
                     "sentence_id": sentence_id,
                     "start": start,
                     "end": end,
                     "text": text,
-                    "speaker_counts": {speaker: 1}
+                    "speaker_counts": {speaker: 1},
+                    "word_count": 1,
+                    "word_start_index": word.get("index"),
+                    "word_end_index": word.get("index")
                 }
             else:
                 current["text"] += f" {text}"
                 current["end"] = end
+                current["word_end_index"] = word.get("index", current.get("word_end_index"))
                 current["speaker_counts"][speaker] = current["speaker_counts"].get(speaker, 0) + 1
+                current["word_count"] += 1
 
-            if ends_sentence:
-                dominant = max(current["speaker_counts"].items(), key=lambda pair: pair[1])[0]
-                sentences.append({
-                    "sentence_id": current["sentence_id"],
-                    "start": current["start"],
-                    "end": current["end"],
-                    "text": current["text"].strip(),
-                    "speaker": dominant
-                })
+            sentence_duration = current["end"] - current["start"]
+            sentence_too_long = (
+                current["word_count"] >= self.MAX_SENTENCE_WORDS
+                or sentence_duration >= self.MAX_SENTENCE_DURATION
+            )
+
+            if self._ends_sentence(text) or sentence_too_long:
+                sentences.append(self._finalize_sentence(current))
                 sentence_id += 1
                 current = None
 
         if current:
-            dominant = max(current["speaker_counts"].items(), key=lambda pair: pair[1])[0]
-            sentences.append({
-                "sentence_id": current["sentence_id"],
-                "start": current["start"],
-                "end": current["end"],
-                "text": current["text"].strip(),
-                "speaker": dominant
-            })
+            sentences.append(self._finalize_sentence(current))
 
         return sentences
+
+    def _finalize_sentence(self, sentence: Dict) -> Dict:
+        dominant = max(sentence["speaker_counts"].items(), key=lambda pair: pair[1])[0]
+        return {
+            "id": sentence["sentence_id"],
+            "sentence_id": sentence["sentence_id"],
+            "paragraph_id": None,
+            "start": sentence["start"],
+            "end": sentence["end"],
+            "text": sentence["text"].strip(),
+            "speaker": dominant,
+            "word_start_index": sentence.get("word_start_index"),
+            "word_end_index": sentence.get("word_end_index")
+        }
 
     async def _semantic_chunk_sentences(self, sentences: List[Dict]) -> List[List[int]]:
         if not self.llm_client or not sentences:
@@ -395,7 +488,10 @@ class STTService:
                     end=end,
                     text=text,
                     speaker=dominant_speaker,
-                    translation=""
+                    translation="",
+                    sentence_ids=[sentence["sentence_id"] for sentence in chunk_sentences],
+                    word_start_index=chunk_sentences[0].get("word_start_index"),
+                    word_end_index=chunk_sentences[-1].get("word_end_index")
                 )
             )
             paragraph_id += 1
@@ -417,7 +513,7 @@ class STTService:
             speaker = word.get("speaker", "Speaker 1")
 
             if current is None:
-                current = self._start_chunk(paragraph_id, start, end, text, speaker)
+                current = self._start_chunk(paragraph_id, start, end, text, speaker, word.get("index"))
                 paragraph_id += 1
                 continue
 
@@ -428,27 +524,38 @@ class STTService:
 
             if speaker_changed or gap > self.MAX_SILENCE_GAP or chunk_too_long:
                 chunks.append(current)
-                current = self._start_chunk(paragraph_id, start, end, text, speaker)
+                current = self._start_chunk(paragraph_id, start, end, text, speaker, word.get("index"))
                 paragraph_id += 1
             else:
                 current["end"] = end
                 current["text"] = f"{current['text']} {text}"
                 current["speaker_counts"][speaker] = current["speaker_counts"].get(speaker, 0) + 1
                 current["last_speaker"] = speaker
+                current["word_end_index"] = word.get("index", current.get("word_end_index"))
 
         if current:
             chunks.append(current)
 
         return [self._finalize_chunk(chunk) for chunk in chunks if chunk["text"].strip()]
 
-    def _start_chunk(self, chunk_id: int, start: float, end: float, text: str, speaker: str) -> Dict:
+    def _start_chunk(
+        self,
+        chunk_id: int,
+        start: float,
+        end: float,
+        text: str,
+        speaker: str,
+        word_index: Optional[int]
+    ) -> Dict:
         return {
             "id": chunk_id,
             "start": start,
             "end": end,
             "text": text,
             "speaker_counts": {speaker: 1},
-            "last_speaker": speaker
+            "last_speaker": speaker,
+            "word_start_index": word_index,
+            "word_end_index": word_index
         }
 
     def _finalize_chunk(self, chunk: Dict) -> ParagraphChunk:
@@ -458,7 +565,9 @@ class STTService:
             start=chunk["start"],
             end=chunk["end"],
             text=chunk["text"].strip(),
-            speaker=dominant
+            speaker=dominant,
+            word_start_index=chunk.get("word_start_index"),
+            word_end_index=chunk.get("word_end_index")
         )
 
     async def _translate_sentences(self, sentences: List[Dict], course_domain: str) -> List[Dict]:

@@ -10,6 +10,9 @@ from pyannote.audio import Pipeline
 
 DEFAULT_MODEL = "medium.en"
 DIARIZATION_MODEL = "pyannote/speaker-diarization"
+DEFAULT_LANGUAGE = "en"
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_COMPUTE_TYPE = "int8"
 
 
 @dataclass
@@ -21,11 +24,25 @@ class WordTimestamp:
     confidence: float
 
 
+def _read_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        print(f"⚠️ Invalid {name}={value!r}; using {default}")
+        return default
+
+
 class WhisperXAdapter:
-    def __init__(self, model_name: str = DEFAULT_MODEL):
+    def __init__(self, model_name: Optional[str] = None):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model_name = model_name
-        self.model = whisperx.load_model(model_name, device=self.device, compute_type="int8")
+        self.model_name = model_name or os.environ.get("WHISPERX_MODEL", DEFAULT_MODEL)
+        self.compute_type = os.environ.get("WHISPERX_COMPUTE_TYPE", DEFAULT_COMPUTE_TYPE)
+        self.batch_size = _read_int_env("WHISPERX_BATCH_SIZE", DEFAULT_BATCH_SIZE)
+        self.language = os.environ.get("WHISPERX_LANGUAGE", DEFAULT_LANGUAGE).strip() or None
+        self.model = whisperx.load_model(self.model_name, device=self.device, compute_type=self.compute_type)
         self.align_cache: Dict[str, Tuple[object, object]] = {}
         self.diarization_pipeline: Optional[Pipeline] = None
 
@@ -40,13 +57,13 @@ class WhisperXAdapter:
             except Exception as exc:
                 print(f"⚠️ Pyannote diarization load failed: {exc}")
 
-    async def transcribe(self, audio_path: str, initial_prompt: Optional[str] = None) -> Dict[str, List[Dict]]:
+    async def transcribe(self, audio_path: str, initial_prompt: Optional[str] = None) -> Dict[str, object]:
         return await asyncio.to_thread(self._transcribe_sync, audio_path, initial_prompt)
 
-    def _transcribe_sync(self, audio_path: str, initial_prompt: Optional[str] = None) -> Dict[str, List[Dict]]:
+    def _transcribe_sync(self, audio_path: str, initial_prompt: Optional[str] = None) -> Dict[str, object]:
         result = self.model.transcribe(
             audio_path,
-            batch_size=16,
+            batch_size=self.batch_size,
             verbose=False,
             **self._build_transcribe_kwargs(initial_prompt)
         )
@@ -64,6 +81,10 @@ class WhisperXAdapter:
         return {
             "segments": result.get("segments", []),
             "language": language,
+            "model": self.model_name,
+            "compute_type": self.compute_type,
+            "batch_size": self.batch_size,
+            "language_hint": self.language,
             "word_timestamps": [word.__dict__ for word in word_timestamps]
         }
 
@@ -145,11 +166,13 @@ class WhisperXAdapter:
             print(f"⚠️ WhisperX speaker assignment failed: {exc}")
             return result
 
-    def _build_transcribe_kwargs(self, initial_prompt: Optional[str]) -> Dict[str, str]:
-        kwargs: Dict[str, str] = {}
+    def _build_transcribe_kwargs(self, initial_prompt: Optional[str]) -> Dict[str, object]:
+        kwargs: Dict[str, object] = {}
+        signature = inspect.signature(self.model.transcribe)
+        if self.language and "language" in signature.parameters:
+            kwargs["language"] = self.language
         if not initial_prompt:
             return kwargs
-        signature = inspect.signature(self.model.transcribe)
         if "initial_prompt" in signature.parameters:
             kwargs["initial_prompt"] = initial_prompt
         elif "prompt" in signature.parameters:

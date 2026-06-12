@@ -4,7 +4,7 @@ import warnings
 
 from fastapi import FastAPI, HTTPException, File, Request, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from backend.api import websocket
 import os
 import hashlib
@@ -14,9 +14,11 @@ from datetime import datetime
 
 from backend.core.llm_client import LLMClient
 from backend.core.whisperx_adapter import WhisperXAdapter
+from backend.schemas.transcript import normalize_transcript_payload
 from backend.services.stt_service import STTService
 from backend.services.summarizer import generate_video_summary  # ✅ 임포트 추가
 from backend.services.summary_service import SummaryService
+from backend.services.transcription_job_service import TranscriptionJobService
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -39,6 +41,7 @@ except EnvironmentError as exc:
     llm_client = None
 
 stt_service = STTService(db, bucket, whisper_adapter=whisper_adapter, llm_client=llm_client)
+transcription_job_service = TranscriptionJobService(db, stt_service)
 summary_service = SummaryService(llm_client=llm_client) if llm_client else None
 
 
@@ -47,8 +50,11 @@ class ParagraphItem(BaseModel):
     start: float
     end: float
     text: str
-    translation: str
-    speaker: str
+    translation: str = ""
+    speaker: str = "Speaker 1"
+    sentence_ids: List[int] = Field(default_factory=list)
+    word_start_index: Optional[int] = None
+    word_end_index: Optional[int] = None
 
 
 class SummaryRequest(BaseModel):
@@ -83,8 +89,13 @@ async def transcribe_media(
             print(f"🔁 기존 파일 {file_hash} 발견 - 캐시된 결과 반환")
             return cached
 
-        await file.seek(0)
-        return await stt_service.transcribe_media(file, user_id, course_domain)
+        return await stt_service.transcribe_bytes(
+            file_bytes=file_bytes,
+            filename=file.filename or "media",
+            content_type=file.content_type,
+            user_id=user_id,
+            course_domain=course_domain,
+        )
     except HTTPException:
         print("⚠️ HTTPException 발생 - 클라이언트 오류")
         raise
@@ -93,6 +104,55 @@ async def transcribe_media(
         raise HTTPException(status_code=500, detail="미디어 처리 중 에러가 발생했습니다.")
     finally:
         await file.close()
+
+
+@app.post("/api/transcription-jobs")
+async def create_transcription_jobs(
+    files: List[UploadFile] = File(...),
+    user_id: str = Form(...),
+    course_domain: str = Form("General")
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="처리할 파일을 제공해 주세요.")
+
+    jobs = []
+    try:
+        for file in files:
+            file_bytes = await file.read()
+            if not file_bytes:
+                continue
+            job = await transcription_job_service.create_job(
+                file_bytes=file_bytes,
+                filename=file.filename or "media",
+                content_type=file.content_type,
+                user_id=user_id,
+                course_domain=course_domain,
+            )
+            jobs.append(job)
+
+        if not jobs:
+            raise HTTPException(status_code=400, detail="비어 있지 않은 파일을 제공해 주세요.")
+
+        return {
+            "jobs": jobs,
+            "max_concurrent": transcription_job_service.max_concurrent
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"❌ 전사 job 생성 에러: {exc}")
+        raise HTTPException(status_code=500, detail="전사 작업 생성 중 에러가 발생했습니다.")
+    finally:
+        for file in files:
+            await file.close()
+
+
+@app.get("/api/transcription-jobs/{job_id}")
+async def get_transcription_job(job_id: str):
+    job = await transcription_job_service.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="전사 작업을 찾을 수 없습니다.")
+    return job
 
 @app.post("/api/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...), user_id: str = Form(...)):
@@ -149,7 +209,12 @@ async def get_file_detail(file_hash: str):
 
     # 2. 해당 파일에 속한 모든 전사 스크립트 가져오기 (ID 순서대로)
     paragraphs_ref = doc_ref.collection('paragraphs').order_by('id').stream()
-    paragraphs = [paragraph.to_dict() for paragraph in paragraphs_ref]
+    raw_paragraphs = [paragraph.to_dict() for paragraph in paragraphs_ref]
+    paragraphs, sentences, word_timestamps = normalize_transcript_payload(
+        raw_paragraphs,
+        file_data.get("sentences", []),
+        file_data.get("word_timestamps", []),
+    )
 
     print(f"✅ {len(paragraphs)}개의 스크립트 조각 로드 완료")
     
@@ -157,8 +222,9 @@ async def get_file_detail(file_hash: str):
         "file_info": file_data,
         "scripts": paragraphs,
         "paragraphs": paragraphs,
-        "sentences": file_data.get("sentences", []),
-        "word_timestamps": file_data.get("word_timestamps", []),
+        "sentences": sentences,
+        "word_timestamps": word_timestamps,
+        "transcription_debug": file_data.get("transcription_debug", {}),
         "summary": file_data.get("summary", {}),
         "video_summary": file_data.get("video_summary", "")
     }
